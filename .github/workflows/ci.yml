@@ -9,9 +9,17 @@ on:
 permissions:
   contents: read
   packages: write
+  security-events: write
 
 env:
+  REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/listmonk2
+
+  # Repo GitOps a actualizar (owner/repo)
+  GITOPS_REPO: jluisreyvargas/listmonk2-gitops
+
+  # Path dentro de repo-gitops donde está el kustomization del entorno a desplegar
+  GITOPS_KUSTOMIZE_PATH: apps/listmonk/overlays/local
 
 jobs:
   lint:
@@ -29,18 +37,23 @@ jobs:
         run: |
           docker run --rm -i hadolint/hadolint < Dockerfile
 
-  build_and_push:
+  build_scan_and_push:
     needs: [lint]
     runs-on: ubuntu-latest
+
+    outputs:
+      deploy_image_ref: ${{ steps.deploy.outputs.deploy_image_ref }}
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -49,15 +62,134 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=sha,format=long,prefix=sha-
             type=ref,event=tag
 
+      # Elegimos qué tag se va a “declarar” en GitOps:
+      # - Si es push de tag v*, usamos ese tag
+      # - Si es push a main, usamos sha-xxxx
+      - name: Select deploy image ref
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAGS="${{ steps.meta.outputs.tags }}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Buscar la línea exacta del tag (ej: ghcr.io/owner/listmonk2:v1.2.3)
+            DEPLOY_REF="$(echo "$TAGS" | grep -E ":${GITHUB_REF_NAME}$" | head -n 1 || true)"
+            if [[ -z "$DEPLOY_REF" ]]; then
+              # Fallback al primero si no lo encuentra (raro)
+              DEPLOY_REF="$(echo "$TAGS" | head -n 1)"
+            fi
+          else
+            # Preferir sha-*
+            DEPLOY_REF="$(echo "$TAGS" | grep -E ":sha-" | head -n 1)"
+          fi
+
+          echo "deploy_image_ref=$DEPLOY_REF" >> "$GITHUB_OUTPUT"
+          echo "Deploy image ref: $DEPLOY_REF"
+
+      # Build local para escaneo (sin push)
+      - name: Build image (local for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Trivy SARIF (no falla) + upload a Code Scanning
+      - name: Trivy scan (SARIF)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.deploy.outputs.deploy_image_ref }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "0"
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Trivy gating (falla si hay HIGH/CRITICAL)
+      - name: Trivy scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.deploy.outputs.deploy_image_ref }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      # Push final (solo en push main / tags)
       - name: Build and push
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  update_gitops:
+    # Solo actualizar GitOps cuando se pushea a main o tag (no PR)
+    if: github.event_name != 'pull_request'
+    needs: [build_scan_and_push]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Update image in kustomization.yaml (GitOps)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEPLOY_REF="${{ needs.build_scan_and_push.outputs.deploy_image_ref }}"
+          cd "gitops/${{ env.GITOPS_KUSTOMIZE_PATH }}"
+
+          echo "Updating image to: $DEPLOY_REF"
+          echo "Repo path: $(pwd)"
+
+          # Usamos kustomize dentro de un contenedor (no dependemos de instalar binarios)
+          docker run --rm \
+            -v "$PWD:/workdir" -w /workdir \
+            ghcr.io/kubernetes-sigs/kustomize/kustomize:v5.4.1 \
+            edit set image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}=$DEPLOY_REF"
+
+          echo "Resulting kustomization.yaml:"
+          sed -n '1,200p' kustomization.yaml
+
+      - name: Commit & push changes to GitOps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd gitops
+
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+
+          git add -A
+
+          # Si no hay cambios (ej. mismo tag), no fallar
+          git commit -m "chore(gitops): bump listmonk2 to ${{ needs.build_scan_and_push.outputs.deploy_image_ref }}" || exit 0
+          git push
