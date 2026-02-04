@@ -188,6 +188,17 @@ jobs:
           token: ${{ secrets.GITOPS_TOKEN }}
           path: gitops
 
+      - name: Install kustomize
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_VERSION="5.4.1"
+          curl -fsSL -o /tmp/kustomize.tgz \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/kustomize.tgz -C /tmp
+          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+          kustomize version
+
       - name: Update image in kustomization.yaml (GitOps)
         shell: bash
         run: |
@@ -199,11 +210,8 @@ jobs:
           echo "Updating image to: $DEPLOY_REF"
           echo "Repo path: $(pwd)"
 
-          # Usamos kustomize dentro de un contenedor (no dependemos de instalar binarios)
-          docker run --rm \
-            -v "$PWD:/workdir" -w /workdir \
-            ghcr.io/kubernetes-sigs/kustomize/kustomize:v5.4.1 \
-            edit set image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}=$DEPLOY_REF"
+          # kustomize edit (sin contenedor)
+          kustomize edit set image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}=$DEPLOY_REF"
 
           echo "Resulting kustomization.yaml:"
           sed -n '1,200p' kustomization.yaml
