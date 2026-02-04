@@ -15,7 +15,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/listmonk2
 
-  # Repo de GitOps a actualizar (owner/repo)
+  # Repo GitOps a actualizar (owner/repo)
   GITOPS_REPO: jluisreyvargas/listmonk2-gitops
 
   # Path dentro de repo-gitops donde está el kustomization del entorno a desplegar
