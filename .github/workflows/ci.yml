@@ -10,6 +10,7 @@ permissions:
   contents: read
   packages: write
   security-events: write
+  id-token: write
 
 env:
   REGISTRY: ghcr.io
@@ -79,14 +80,11 @@ jobs:
           TAGS="${{ steps.meta.outputs.tags }}"
 
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            # Buscar la línea exacta del tag (ej: ghcr.io/owner/listmonk2:v1.2.3)
             DEPLOY_REF="$(echo "$TAGS" | grep -E ":${GITHUB_REF_NAME}$" | head -n 1 || true)"
             if [[ -z "$DEPLOY_REF" ]]; then
-              # Fallback al primero si no lo encuentra (raro)
               DEPLOY_REF="$(echo "$TAGS" | head -n 1)"
             fi
           else
-            # Preferir sha-*
             DEPLOY_REF="$(echo "$TAGS" | grep -E ":sha-" | head -n 1)"
           fi
 
@@ -123,7 +121,6 @@ jobs:
 
       # Trivy gating (TEMP non-blocking): genera reporte pero no rompe el pipeline
       # Trivy findings (last run on 2026-02-04):
-      # - TODO: pega aquí 2-3 CVEs representativos del último run (CRITICAL/HIGH)
       # Notes:
       # - Root cause likely base image / libs (alpine/ssl) o paquetes desactualizados.
       # - Plan: actualizar base image / runtime (distroless) y volver a activar el gating estricto.
@@ -164,6 +161,7 @@ jobs:
 
       # Push final (solo en push main / tags)
       - name: Build and push
+        id: build_push
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
@@ -173,6 +171,31 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Cosign (keyless/OIDC) - firma por digest para todas las tags generadas
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Cosign sign (keyless OIDC)
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Digest: ${DIGEST}"
+          echo "Signing tags:"
+          printf '%s\n' "${TAGS}"
+
+          images=()
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            images+=("${tag}@${DIGEST}")
+          done <<< "${TAGS}"
+
+          cosign sign --yes "${images[@]}"
 
   update_gitops:
     # Solo actualizar GitOps cuando se pushea a main o tag (no PR)
@@ -187,6 +210,7 @@ jobs:
           repository: ${{ env.GITOPS_REPO }}
           token: ${{ secrets.GITOPS_TOKEN }}
           path: gitops
+          persist-credentials: false
 
       - name: Install kustomize
         shell: bash
@@ -210,7 +234,6 @@ jobs:
           echo "Updating image to: $DEPLOY_REF"
           echo "Repo path: $(pwd)"
 
-          # kustomize edit (sin contenedor)
           kustomize edit set image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}=$DEPLOY_REF"
 
           echo "Resulting kustomization.yaml:"
@@ -227,6 +250,8 @@ jobs:
 
           git add -A
 
-          # Si no hay cambios (ej. mismo tag), no fallar
           git commit -m "chore(gitops): bump listmonk2 to ${{ needs.build_scan_and_push.outputs.deploy_image_ref }}" || exit 0
+
+          # Forzar uso del PAT para evitar que empuje con credenciales erróneas
+          git remote set-url origin "https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/${{ env.GITOPS_REPO }}.git"
           git push
