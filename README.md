@@ -29,4 +29,4 @@ cosign verify   --certificate-oidc-issuer https://token.actions.githubuserconten
 ```
 
 ---
-Generado: 2026-02-05T16:01:07.344201Z
+
